@@ -43,6 +43,12 @@ FAST_MODE = config.get("FAST_MODE", True)
 # doesn't allow to connect in not-secure mode
 SECURE_ONLY = config.get("SECURE_ONLY", False)
 
+# length of used handshake randoms for active fingerprinting protection
+REPLAY_CHECK_LEN = config.get("REPLAY_CHECK_LEN", 32768)
+
+# block short first packets to even more protect against replay-based fingerprinting
+BLOCK_SHORT_FIRST_PKT = config.get("BLOCK_SHORT_FIRST_PKT", True)
+
 # delay in seconds between stats printing
 STATS_PRINT_PERIOD = config.get("STATS_PRINT_PERIOD", 600)
 
@@ -130,6 +136,7 @@ MIN_MSG_LEN = 12
 MAX_MSG_LEN = 2 ** 24
 
 my_ip_info = {"ipv4": None, "ipv6": None}
+used_handshakes = collections.OrderedDict()
 
 
 def setup_files_limit():
@@ -601,18 +608,30 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
 
 
 async def handle_handshake(reader, writer):
+    global used_handshakes
+    EMPTY_READ_BUF_SIZE = 4096
+
     handshake = await reader.readexactly(HANDSHAKE_LEN)
+    dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN]
+    dec_prekey, dec_iv = dec_prekey_and_iv[:PREKEY_LEN], dec_prekey_and_iv[PREKEY_LEN:]
+    enc_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN][::-1]
+    enc_prekey, enc_iv = enc_prekey_and_iv[:PREKEY_LEN], enc_prekey_and_iv[PREKEY_LEN:]
+
+    if dec_prekey_and_iv in used_handshakes:
+        ip = writer.get_extra_info('peername')[0]
+        print_err("Active fingerprinting detected from %s, freezing it" % ip)
+        while await reader.read(EMPTY_READ_BUF_SIZE):
+            # just consume all the data
+            pass
+
+        return False
 
     for user in USERS:
         secret = bytes.fromhex(USERS[user])
 
-        dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN]
-        dec_prekey, dec_iv = dec_prekey_and_iv[:PREKEY_LEN], dec_prekey_and_iv[PREKEY_LEN:]
         dec_key = hashlib.sha256(dec_prekey + secret).digest()
         decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))
 
-        enc_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN][::-1]
-        enc_prekey, enc_iv = enc_prekey_and_iv[:PREKEY_LEN], enc_prekey_and_iv[PREKEY_LEN:]
         enc_key = hashlib.sha256(enc_prekey + secret).digest()
         encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
 
@@ -627,11 +646,14 @@ async def handle_handshake(reader, writer):
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
+        while len(used_handshakes) >= REPLAY_CHECK_LEN:
+            used_handshakes.popitem(last=False)
+        used_handshakes[dec_prekey_and_iv] = True
+
         reader = CryptoWrappedStreamReader(reader, decryptor)
         writer = CryptoWrappedStreamWriter(writer, encryptor)
         return reader, writer, proto_tag, user, dc_idx, enc_key + enc_iv
 
-    EMPTY_READ_BUF_SIZE = 4096
     while await reader.read(EMPTY_READ_BUF_SIZE):
         # just consume all the data
         pass
@@ -911,6 +933,7 @@ async def handle_client(reader_clt, writer_clt):
     set_ack_timeout(writer_clt.get_extra_info("socket"), CLIENT_ACK_TIMEOUT)
     set_bufsizes(writer_clt.get_extra_info("socket"), TO_TG_BUFSIZE, TO_CLT_BUFSIZE)
 
+    cl_ip, cl_port = writer_clt.get_extra_info('peername')[:2]
     try:
         clt_data = await asyncio.wait_for(handle_handshake(reader_clt, writer_clt),
                                           timeout=CLIENT_HANDSHAKE_TIMEOUT)
@@ -930,7 +953,6 @@ async def handle_client(reader_clt, writer_clt):
         else:
             tg_data = await do_direct_handshake(proto_tag, dc_idx)
     else:
-        cl_ip, cl_port = writer_clt.upstream.get_extra_info('peername')[:2]
         tg_data = await do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port)
 
     if not tg_data:
@@ -963,7 +985,8 @@ async def handle_client(reader_clt, writer_clt):
         else:
             return
 
-    async def connect_reader_to_writer(rd, wr, user, rd_buf_size):
+    async def connect_reader_to_writer(rd, wr, user, rd_buf_size, block_short_first_pkt=False):
+        is_first_pkt = True
         try:
             while True:
                 data = await rd.read(rd_buf_size)
@@ -971,6 +994,19 @@ async def handle_client(reader_clt, writer_clt):
                     data, extra = data
                 else:
                     extra = {}
+
+                if is_first_pkt:
+                    # protection against replay-based fingerprinting
+                    MIN_FIRST_PKT_SIZE = 12
+                    if block_short_first_pkt and 0 < len(data) < MIN_FIRST_PKT_SIZE:
+                        # print_err("Active fingerprinting detected from %s, dropping it" % cl_ip)
+                        # print_err("If this causes problems set BLOCK_SHORT_FIRST_PKT = False "
+                        #          "in the config")
+
+                        wr.write_eof()
+                        await wr.drain()
+                        return
+                    is_first_pkt = False
 
                 if not data:
                     wr.write_eof()
@@ -984,7 +1020,8 @@ async def handle_client(reader_clt, writer_clt):
             # print_err(e)
             pass
 
-    tg_to_clt = connect_reader_to_writer(reader_tg, writer_clt, user, TO_CLT_BUFSIZE)
+    tg_to_clt = connect_reader_to_writer(reader_tg, writer_clt, user, TO_CLT_BUFSIZE,
+                                         block_short_first_pkt=BLOCK_SHORT_FIRST_PKT)
     clt_to_tg = connect_reader_to_writer(reader_clt, writer_tg, user, TO_TG_BUFSIZE)
     task_tg_to_clt = asyncio.ensure_future(tg_to_clt)
     task_clt_to_tg = asyncio.ensure_future(clt_to_tg)
@@ -1108,7 +1145,7 @@ def init_ip_info():
         except Exception:
             return None
 
-    IPV4_URL1 = "http://v4.ident.me/)"
+    IPV4_URL1 = "http://v4.ident.me/"
     IPV4_URL2 = "http://ipv4.icanhazip.com/"
 
     IPV6_URL1 = "http://v6.ident.me/"
